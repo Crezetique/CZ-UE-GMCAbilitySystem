@@ -997,10 +997,13 @@ private:
 
 	// Event Implementations
 
+public:
 	// Execute an event that is created by the server where execution is synced between server and client
 	UFUNCTION(BlueprintCallable, Category = "GMASSyncedEvent")
 	void ExecuteSyncedEvent(FGMASSyncedEventContainer EventData);
-	
+
+private:
+
 	UFUNCTION(BlueprintCallable, DisplayName="Add Impulse (Synced Event)", Category = "GMASSyncedEvent")
 	void AddImpulse(FVector Impulse, bool bVelChange = false);
 

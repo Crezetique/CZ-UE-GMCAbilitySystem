@@ -2285,15 +2285,12 @@ void UGMC_AbilitySystemComponent::ExecuteSyncedEvent(FGMASSyncedEventContainer E
 	}
 
 	EventData.EventType = EGMASSyncedEventType::BlueprintImplemented;
-	
-	// TGMASBoundQueueOperation<UGMASSyncedEvent, FGMASSyncedEventContainer> Operation;	
-	// if (CreateSyncedEventOperation(Operation, EventData) == -1 )
-	// {
-	// 	UE_LOG(LogGMCAbilitySystem, Error, TEXT("Failed to create SyncedEvent"));
-	// 	return;
-	// }
-	
-	// ClientQueueOperation(Operation);
+
+	FGMASBoundQueueV2CustomEventOperation EventOperation;
+	EventOperation.EventTag = EventData.EventTag;
+	EventOperation.InstancedPayload = EventData.InstancedPayload;
+	const int OperationID = BoundQueueV2.MakeOperationData<FGMASBoundQueueV2CustomEventOperation>(EventOperation);
+	BoundQueueV2.QueueServerOperation(OperationID);
 }
 
 bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationData, bool bFromMovementTick, bool bForce)
@@ -2541,6 +2538,23 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 		if (!HasAuthority() && !BoundQueueV2.bInBatchDispatch)
 		{
 			// Make an operation to confirm the location change
+			BoundQueueV2.OperationData = FInstancedStruct::Make<FGMASBoundQueueV2AcknowledgeOperation>(FGMASBoundQueueV2AcknowledgeOperation{OperationID});
+		}
+		return true;
+	}
+
+	// Custom Event (Synced Event)
+	if (StructType == FGMASBoundQueueV2CustomEventOperation::StaticStruct())
+	{
+		const FGMASBoundQueueV2CustomEventOperation EventOperation = PayloadData.Get<FGMASBoundQueueV2CustomEventOperation>();
+		FGMASSyncedEventContainer EventData;
+		EventData.EventType = EGMASSyncedEventType::BlueprintImplemented;
+		EventData.EventTag = EventOperation.EventTag;
+		EventData.InstancedPayload = EventOperation.InstancedPayload;
+		OnSyncedEvent.Broadcast(EventData);
+		if (!HasAuthority() && !BoundQueueV2.bInBatchDispatch)
+		{
+			// Make an operation to confirm the event execution
 			BoundQueueV2.OperationData = FInstancedStruct::Make<FGMASBoundQueueV2AcknowledgeOperation>(FGMASBoundQueueV2AcknowledgeOperation{OperationID});
 		}
 		return true;
