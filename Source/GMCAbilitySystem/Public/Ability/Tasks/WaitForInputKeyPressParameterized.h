@@ -4,11 +4,13 @@
 #include "Ability/Tasks/GMCAbilityTaskBase.h"
 #include "EnhancedInputComponent.h"
 #include "Ability/GMCAbility.h"
-#if ENGINE_MAJOR_VERSION >=5 && ENGINE_MINOR_VERSION >= 5
-#include "StructUtils/InstancedStruct.h"
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+	#include "StructUtils/InstancedStruct.h"  // UE 5.5+
 #else
-#include "InstancedStruct.h"
+	#include "InstancedStruct.h"              // UE 5.4 and earlier
 #endif
+
 #include "LatentActions.h"
 #include "WaitForInputKeyPressParameterized.generated.h"
 
@@ -54,7 +56,7 @@ protected:
 	
 	void OnKeyPressed(const FInputActionValue& InputActionValue);
 	
-	/** If true, we may complete this task during activation if the ability's input action key is already released. */
+	/** If true, the task completes during activation when the given input action is already pressed. */
 	UPROPERTY(Transient)
 	bool bShouldCheckForPressDuringActivation = false;
 

@@ -1,9 +1,11 @@
 ﻿#pragma once
-#if ENGINE_MAJOR_VERSION >=5 && ENGINE_MINOR_VERSION >= 5
-#include "StructUtils/InstancedStruct.h"
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+#include "StructUtils/InstancedStruct.h"  // UE 5.5+
 #else
-#include "InstancedStruct.h"
+#include "InstancedStruct.h"              // UE 5.4 and earlier
 #endif
+
 #include "Ability/GMCAbility.h"
 #include "Ability/Tasks/GMCAbilityTaskData.h"
 #include "GMCAbilityTaskBase.generated.h"
@@ -92,8 +94,13 @@ protected:
 	/** Task Owner that created us */
 	TWeakObjectPtr<AActor> TaskOwner;
 
-	// Whether this task is running on a client or a client on a listen server
-	bool IsClientOrRemoteListenServerPawn() const;
+	// True on the machine that produces this pawn's moves: any client (in practice the autonomous proxy), standalone,
+	// and a server for a pawn it controls locally (listen host, AI). False on a server for a
+	// remotely controlled pawn, which only ever waits for that client's payloads.
+	bool DrivesPawnLocally() const;
+
+	UE_DEPRECATED(5.8, "GMAS 1.4.1: the name inverted the meaning; use DrivesPawnLocally()")
+	bool IsClientOrRemoteListenServerPawn() const { return DrivesPawnLocally(); }
 
 private:
 	// How often the client sends heartbeats to the server, in real seconds.

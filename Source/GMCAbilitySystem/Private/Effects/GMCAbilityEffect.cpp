@@ -1,11 +1,10 @@
-﻿// Fill out your copyright notice in the Description page of Project Settings.
+﻿// GMAS - GMC Ability System. MIT License, see LICENSE.
 
 
 #include "Effects/GMCAbilityEffect.h"
 
 #include "GMCAbilitySystem.h"
 #include "Components/GMCAbilityComponent.h"
-#include "Interfaces/IPluginManager.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Kismet/KismetSystemLibrary.h"
 
@@ -69,6 +68,13 @@ void UGMCAbilityEffect::InitializeEffect(FGMCAbilityEffectData InitializationDat
 	}
 }
 
+void UGMCAbilityEffect::InitializeForQuery(UGMC_AbilitySystemComponent* InOwner)
+{
+	OwnerAbilityComponent = InOwner;
+	EffectData.OwnerAbilityComponent = InOwner;
+	EffectData.SourceAbilityComponent = InOwner;
+}
+
 
 void UGMCAbilityEffect::StartEffect()
 {
@@ -84,9 +90,11 @@ void UGMCAbilityEffect::StartEffect()
 		return;
 	}
 	
-	// Effect Query
-	if (!EffectData.ActivationQuery.IsEmpty() && !EffectData.ActivationQuery.Matches(OwnerAbilityComponent->GetActiveTags()))
-		{
+	// Effect queries. The maintain query is also checked at start: a delayed effect whose query is
+	// unsatisfied at StartTime never applies (before, it applied and ended on its next tick).
+	if ((!EffectData.ActivationQuery.IsEmpty() && !EffectData.ActivationQuery.Matches(OwnerAbilityComponent->GetActiveTags()))
+		|| (!EffectData.MustMaintainQuery.IsEmpty() && !EffectData.MustMaintainQuery.Matches(OwnerAbilityComponent->GetActiveTags())))
+	{
 		EndEffect();
 		return;
 	}
@@ -97,11 +105,21 @@ void UGMCAbilityEffect::StartEffect()
 
 	EndActiveAbilitiesByDefinitionQuery(EffectData.EndAbilityOnActivationQuery);
 
+	// An ability ended just above may have removed this effect (RemoveEffectOnEnd, an OnAbilityEnded
+	// listener). EndEffect returned early because nothing was applied yet, so roll back the grants and
+	// let the component treat the apply as refused.
+	if (bCompleted)
+	{
+		RemoveTagsFromOwner(EffectData.bPreserveGrantedTagsIfMultiple);
+		RemoveAbilitiesFromOwner(EffectData.bPreserveGrantedTagsIfMultiple);
+		return;
+	}
+
 	bHasAppliedEffect = true;
 
 	OwnerAbilityComponent->OnEffectApplied.Broadcast(this);
+	if (bCompleted) { return; }   // a listener removed us; EndEffect already rolled back
 
-	// Instant effects modify base value and end instantly
 	if (EffectData.EffectType == EGMASEffectType::Instant
 		|| EffectData.EffectType == EGMASEffectType::Persistent
 		|| (EffectData.EffectType == EGMASEffectType::Periodic && EffectData.bPeriodicFirstTick))
@@ -114,16 +132,17 @@ void UGMCAbilityEffect::StartEffect()
 			OwnerAbilityComponent->ApplyAbilityAttributeModifier(ModCpy);
 			OnAttributeModifierApplication(ModCpy);
 		}
-
-		if (EffectData.EffectType == EGMASEffectType::Instant)
-		{
-			EndEffect();
-		}
 	}
-	
-	StartEffectEvent();
 
+	StartEffectEvent();
+	if (bCompleted) { return; }   // the start event ended the effect; keep it Ended
 	UpdateState(EGMASEffectState::Started, true);
+
+	// Instant effects are done once their modifiers are in: start, then end, in that order.
+	if (EffectData.EffectType == EGMASEffectType::Instant)
+	{
+		EndEffect();
+	}
 }
 
 
@@ -166,7 +185,7 @@ void UGMCAbilityEffect::EndEffect()
 
 	EndActiveAbilitiesFromOwner(EffectData.CancelAbilityOnEnd);
 	RemoveTagsFromOwner(EffectData.bPreserveGrantedTagsIfMultiple);
-	RemoveAbilitiesFromOwner();
+	RemoveAbilitiesFromOwner(EffectData.bPreserveGrantedTagsIfMultiple);
 
 	OwnerAbilityComponent->OnEffectRemoved.Broadcast(this);
 
@@ -230,10 +249,12 @@ void UGMCAbilityEffect::BeginDestroy() {
 
 void UGMCAbilityEffect::Tick(float DeltaTime)
 {
-	// Per-effect profiling scope, named by effect tag (class-name fallback). Zero cost in
-	// Shipping (macro + argument compiled out when CPUPROFILERTRACE_ENABLED == 0).
-	TRACE_CPUPROFILER_EVENT_SCOPE_TEXT(*FString::Printf(TEXT("Effect::Tick [%s]"),
-		EffectData.EffectTag.IsValid() ? *EffectData.EffectTag.ToString() : *GetClass()->GetName()));
+	// Per-effect profiling scope, named by effect tag (class-name fallback). The name is only
+	// formatted while the CPU trace channel is on; zero cost in Shipping (macro + argument
+	// compiled out when CPUPROFILERTRACE_ENABLED == 0).
+	TRACE_CPUPROFILER_EVENT_SCOPE_TEXT(*(UE_TRACE_CHANNELEXPR_IS_ENABLED(CpuChannel)
+		? FString::Printf(TEXT("Effect::Tick [%s]"), EffectData.EffectTag.IsValid() ? *EffectData.EffectTag.ToString() : *GetClass()->GetName())
+		: FString()));
 
 	// Consume the bilateral predicted-end defer. Uses an absolute ActionTimer timestamp instead of a
 	// per-tick countdown — both client and server compute the same EndAtActionTimer (same move log,
@@ -267,6 +288,7 @@ void UGMCAbilityEffect::Tick(float DeltaTime)
 	// across combined-client-move re-executions and identical on server and client,
 	// so both sides compute the same shift. Skipped during replay: rewound bound tag
 	// state would latch/shift off transient values and corrupt the live anchor.
+	// Runs before the not-started early-out so a pause also holds the Start Delay.
 	if (EffectData.bPauseEffectAffectsDuration
 		&& EffectData.PauseEffect.IsEmpty() == false
 		&& OwnerAbilityComponent && OwnerAbilityComponent->IsReplayingForGMASLogic() == false)
@@ -288,19 +310,31 @@ void UGMCAbilityEffect::Tick(float DeltaTime)
 		}
 	}
 
-	// While the latch is armed, CurrentDuration holds at the anchor and CheckState
-	// is skipped below (no Initialized->Started transition, no duration expiry). On
+	// While the latch is armed, CheckState is skipped (no Initialized->Started
+	// transition, no duration expiry) and CurrentDuration holds at the anchor. On
 	// unpause the shift above preserves continuity: ActionTimer - shifted StartTime
 	// resumes exactly from the held value.
 	const bool bTimingPaused = PausedAtActionTimer >= 0.0;
+
+	// Not started yet (Delay > 0): only the start check runs; no duration, tick event or
+	// maintain-tag check until StartEffect has applied the effect.
+	if (CurrentState == EGMASEffectState::Initialized)
+	{
+		if (bTimingPaused == false)
+		{
+			CheckState();
+		}
+		return;
+	}
+
 	if (bTimingPaused)
 	{
 		EffectData.CurrentDuration = PausedAtActionTimer - EffectData.StartTime;
-	} else
+	}
+	else
 	{
 		EffectData.CurrentDuration = OwnerAbilityComponent->ActionTimer - EffectData.StartTime;
 	}
-	
 	TickEvent(DeltaTime);
 	
 	// Ensure tag requirements are met before applying the effect
@@ -429,19 +463,6 @@ void UGMCAbilityEffect::Tick(float DeltaTime)
 	}
 }
 
-int32 UGMCAbilityEffect::CalculatePeriodicTicksBetween(float Period, float StartActionTimer, float EndActionTimer)
-{
-	if (Period <= 0.0f || EndActionTimer <= StartActionTimer) { return 0; }
-	
-	float FirstTick = FMath::CeilToFloat(StartActionTimer / Period) * Period;
-	if (FirstTick > EndActionTimer) { return 0; }
-
-
-	float LastTick = FMath::FloorToFloat(EndActionTimer / Period) * Period;
-	
-	return FMath::RoundToInt((LastTick - FirstTick) / Period) + 1;
-}
-
 void UGMCAbilityEffect::TickEvent_Implementation(float DeltaTime)
 {
 }
@@ -471,7 +492,7 @@ void UGMCAbilityEffect::UpdateState(EGMASEffectState State, bool Force)
 	CurrentState = State;
 }
 
-bool UGMCAbilityEffect::IsPaused()
+bool UGMCAbilityEffect::IsPaused() const
 {
 	return DoesOwnerHaveTagFromContainer(EffectData.PauseEffect);
 }
@@ -481,21 +502,12 @@ bool UGMCAbilityEffect::IsEffectModifiersRegisterInHistory() const
 	return EffectData.EffectType != EGMASEffectType::Instant && EffectData.bNegateEffectAtEnd;
 }
 
-float UGMCAbilityEffect::ProcessCustomModifier(const TSubclassOf<UGMCAttributeModifierCustom_Base>& MCClass, const FAttribute* Attribute)
+FString UGMCAbilityEffect::ToString() const
 {
-	UGMCAttributeModifierCustom_Base** MCI = CustomModifiersInstances.Find(MCClass);
-	if (MCI == nullptr)
-	{
-		MCI = &CustomModifiersInstances.Add(MCClass, NewObject<UGMCAttributeModifierCustom_Base>(this, MCClass));
-	}
-
-	if (*MCI == nullptr)
-	{
-		UE_LOG(LogGMCAbilitySystem, Error, TEXT("Custom Modifier Instance is null for class %s in UGMCAbilityEffect::ProcessCustomModifier"), *MCClass->GetName());
-		return 0.f;
-	}
-
-	return (*MCI)->Calculate(this, Attribute);
+	return FString::Printf(TEXT("[name: %s] (%s) | %s | %s | %s | Data: %s"), *GetName().Right(30), *EnumToString(CurrentState),
+		bHasStarted ? TEXT("Started") : TEXT("Not Started"), IsPaused() ? TEXT("Paused") : TEXT("Running"),
+		OwnerAbilityComponent ? *OwnerAbilityComponent->DescribeEffectAnswerState(EffectData.EffectID) : TEXT("no owner"),
+		*EffectData.ToString());
 }
 
 
@@ -535,39 +547,50 @@ void UGMCAbilityEffect::AddTagsToOwner()
 
 void UGMCAbilityEffect::RemoveTagsFromOwner(bool bPreserveOnMultipleInstances)
 {
-	if (bPreserveOnMultipleInstances)
-	{
-		if (EffectData.EffectTag.IsValid()) {
-			// Skip self and bCompleted zombies: ActiveEffects retains entries until the
-			// next TickActiveEffects cleanup pass, and counting them as siblings would
-			// preserve tags that no live instance owns. Deferred (EndAtActionTimer >= 0,
-			// !bCompleted) DOES count — still ticking modifiers, still owns the slot.
-			const TArray<UGMCAbilityEffect*> SameTagEffects =
-				OwnerAbilityComponent->GetActiveEffectsByTag(EffectData.EffectTag);
-
-			int32 OthersStillAlive = 0;
-			for (const UGMCAbilityEffect* Other : SameTagEffects)
-			{
-				if (Other && Other != this && !Other->bCompleted)
-				{
-					++OthersStillAlive;
-				}
-			}
-
-			if (OthersStillAlive > 0) {
-				return;
-			}
-		}
-		else
-		{
-			UE_LOG(LogGMCAbilitySystem, Warning, TEXT("Effect Tag is not valid with PreserveMultipleInstances in UGMCAbilityEffect::RemoveTagsFromOwner"));
-		}
-	}
-
-
+	// ActiveTags / ClientAuthActiveTags are set-like (no per-tag refcount), so
+	// two effects granting the same GrantedTag collapse to ONE entry. Without a
+	// guard, the first of several effects sharing a GrantedTag to end would
+	// strip that single shared entry out from under the others — e.g. a short
+	// self-root (a movement-blocking effect, ~0.9s) ending would clear the
+	// movement-lock tag that an active stun effect (2s) still needs, freeing the
+	// pawn while it's still stunned.
+	//
+	// When bPreserveOnMultipleInstances, scan PER GrantedTag: keep the tag if any
+	// OTHER live effect routed to the same container (matched by bClientAuth)
+	// still grants it. This generalizes the previous same-EffectTag-only preserve
+	// to ANY granter regardless of EffectTag/class, and subsumes same-effect
+	// stacking (a live sibling instance grants the same tags → preserved). Skip
+	// self and bCompleted zombies (ActiveEffects retains entries until the next
+	// TickActiveEffects cleanup pass; a completed instance no longer owns its
+	// tags). Matching bClientAuth keeps the two containers independent so we
+	// never leave a stale entry in one because the other still grants the tag.
+	const TMap<int, UGMCAbilityEffect*> ActiveEffectsSnapshot =
+		bPreserveOnMultipleInstances && OwnerAbilityComponent
+			? OwnerAbilityComponent->GetActiveEffects()
+			: TMap<int, UGMCAbilityEffect*>();
 
 	for (const FGameplayTag Tag : EffectData.GrantedTags)
 	{
+		if (bPreserveOnMultipleInstances)
+		{
+			bool bAnotherGranterAlive = false;
+			for (const TPair<int, UGMCAbilityEffect*>& Pair : ActiveEffectsSnapshot)
+			{
+				const UGMCAbilityEffect* Other = Pair.Value;
+				if (Other && Other != this && !Other->bCompleted
+					&& Other->EffectData.bClientAuth == EffectData.bClientAuth
+					&& Other->EffectData.GrantedTags.HasTagExact(Tag))
+				{
+					bAnotherGranterAlive = true;
+					break;
+				}
+			}
+			if (bAnotherGranterAlive)
+			{
+				continue; // another active effect still owns this tag
+			}
+		}
+
 		if (EffectData.bClientAuth)
 		{
 			OwnerAbilityComponent->RemoveClientAuthActiveTag(Tag);
@@ -587,11 +610,29 @@ void UGMCAbilityEffect::AddAbilitiesToOwner()
 	}
 }
 
-void UGMCAbilityEffect::RemoveAbilitiesFromOwner()
+void UGMCAbilityEffect::RemoveAbilitiesFromOwner(bool bPreserveOnMultipleInstances)
 {
+	// Same rule as RemoveTagsFromOwner: GrantedAbilityTags is set-like, so a grant that another
+	// live effect still makes must survive this effect's end.
+	const TMap<int, UGMCAbilityEffect*> ActiveEffectsSnapshot =
+		bPreserveOnMultipleInstances && OwnerAbilityComponent ? OwnerAbilityComponent->GetActiveEffects() : TMap<int, UGMCAbilityEffect*>();
+
 	for (const FGameplayTag Tag : EffectData.GrantedAbilities)
 	{
-		OwnerAbilityComponent->RemoveGrantedAbilityByTag(Tag);
+		bool bAnotherGranterAlive = false;
+		for (const TPair<int, UGMCAbilityEffect*>& Pair : ActiveEffectsSnapshot)
+		{
+			const UGMCAbilityEffect* Other = Pair.Value;
+			if (Other && Other != this && !Other->bCompleted && Other->EffectData.GrantedAbilities.HasTagExact(Tag))
+			{
+				bAnotherGranterAlive = true;
+				break;
+			}
+		}
+		if (!bAnotherGranterAlive)
+		{
+			OwnerAbilityComponent->RemoveGrantedAbilityByTag(Tag);
+		}
 	}
 }
 
@@ -600,11 +641,11 @@ void UGMCAbilityEffect::EndActiveAbilitiesFromOwner(const FGameplayTagContainer&
 	
 	for (const FGameplayTag Tag : TagContainer)
 	{
-		OwnerAbilityComponent->EndAbilitiesByTag(Tag);
+		OwnerAbilityComponent->CancelAbilitiesByTag(Tag);
 	}
 }
 
-bool UGMCAbilityEffect::DoesOwnerHaveTagFromContainer(FGameplayTagContainer& TagContainer) const
+bool UGMCAbilityEffect::DoesOwnerHaveTagFromContainer(const FGameplayTagContainer& TagContainer) const
 {
 	for (const FGameplayTag Tag : TagContainer)
 	{
@@ -624,7 +665,6 @@ void UGMCAbilityEffect::CheckState()
 			if (OwnerAbilityComponent->ActionTimer >= EffectData.StartTime)
 			{
 				StartEffect();
-				UpdateState(EGMASEffectState::Started, true);
 			}
 			break;
 		case EGMASEffectState::Started:
@@ -644,7 +684,7 @@ void UGMCAbilityEffect::EndActiveAbilitiesByDefinitionQuery(FGameplayTagQuery En
 
 	if (EndAbilityOnActivationViaDefinitionQuery.IsEmpty()) return;
 
-	int NumCancelled = OwnerAbilityComponent->EndAbilitiesByQuery(EndAbilityOnActivationViaDefinitionQuery);
+	int NumCancelled = OwnerAbilityComponent->CancelAbilitiesByQuery(EndAbilityOnActivationViaDefinitionQuery);
 
 	UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Effect %s cancelled %d ability(ies) via EffectDefinition query."),
 		*EffectData.EffectTag.ToString(), NumCancelled);
