@@ -151,6 +151,9 @@ public:
 	
 	bool IsValidClientOperation(const FInstancedStruct& Data) const;
 
+	// The server's check on a remotely controlled pawn's live slot: a client-made (negative id) operation of an allowed type.
+	bool IsValidLiveClientOperation(const FInstancedStruct& Data) const;
+
 	// Queue a Client operation
 	void QueueClientOperation(const int OperationID);
 

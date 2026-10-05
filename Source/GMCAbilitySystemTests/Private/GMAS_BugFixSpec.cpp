@@ -15,6 +15,24 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+// Counts Warning-or-worse lines containing Needle while in scope, so a spec can assert a log line is absent.
+struct FGMASBugFixLogCapture : public FOutputDevice
+{
+	FString Needle;
+	int32 Hits = 0;
+
+	explicit FGMASBugFixLogCapture(const TCHAR* InNeedle) : Needle(InNeedle) { GLog->AddOutputDevice(this); }
+	virtual ~FGMASBugFixLogCapture() override { GLog->RemoveOutputDevice(this); }
+
+	virtual void Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category) override
+	{
+		if ((Verbosity & ELogVerbosity::VerbosityMask) <= ELogVerbosity::Warning && FCString::Strstr(V, *Needle))
+		{
+			++Hits;
+		}
+	}
+};
+
 BEGIN_DEFINE_SPEC(FGMASBugFixSpec,
 	"GMAS.Unit.BugFix",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -234,6 +252,37 @@ void FGMASBugFixSpec::Define()
 				AbilityComp->GetActiveEffects().Num(), 1);
 		});
 
+		It("a forced op spends its loopback id: no pending report, no drop on the next local move", [this, MakeApplyEffectOp]()
+		{
+			AbilityComp->SetActionTimerForTest(1.0);
+			AbilityComp->bForceNoAckClientForTest = true;
+			AbilityComp->BindServerOpForcedDelegateForTest();
+
+			FGMASBoundQueueV2& Q = AbilityComp->GetBoundQueueV2ForTest();
+			const int OpID = MakeApplyEffectOp(779);
+
+			AbilityComp->EnqueueServerOperationForTest(OpID);
+			// The harness leaves the Client-RPC delegate unbound; queue the id the way the server's own
+			// loopback RPCOnServerOperationAdded does for a pawn with no owning connection.
+			Q.ClientQueuedOperations.Add(OpID);
+
+			FGMASBugFixLogCapture PendingCapture(TEXT("ClientQueuedOperations has"));
+			Q.GenAncillaryTick(0.016f);
+
+			TestEqual("effect applied once by the force", AbilityComp->GetActiveEffects().Num(), 1);
+			TestTrue("applied under its server-auth EffectID", AbilityComp->GetActiveEffects().Contains(779));
+			TestEqual("loopback id spent by the force", Q.ClientQueuedOperations.Num(), 0);
+			TestEqual("no pending-operations report", PendingCapture.Hits, 0);
+
+			FGMASBugFixLogCapture DropCapture(TEXT("Dropped"));
+			Q.GenPreLocalMoveExecution();
+
+			TestEqual("no dropped-operation warning on the next local move", DropCapture.Hits, 0);
+			TestTrue("next local move ships an empty slot",
+				Q.OperationData.GetScriptStruct() == FGMASBoundQueueV2OperationBaseData::StaticStruct());
+			TestEqual("still exactly one effect", AbilityComp->GetActiveEffects().Num(), 1);
+		});
+
 		It("routes through the grace/ack queue when an acking client exists", [this, MakeApplyEffectOp]()
 		{
 			AbilityComp->SetActionTimerForTest(1.0);
@@ -261,6 +310,48 @@ void FGMASBugFixSpec::Define()
 			AbilityComp->bForceNoAckClientForTest = true;
 			TestTrue("forced no-client decision selects the immediate path",
 				AbilityComp->ShouldApplyServerOpImmediatelyForTest());
+		});
+	});
+
+	// Server-operation log noise: a server operation's echo in a remote pawn's live slot must not be
+	// reported as rejected client input.
+	Describe("Server-operation log noise", [this]()
+	{
+		It("live-slot check skips a server-made (positive) id without logging", [this]()
+		{
+			FGMASBoundQueueV2& Q = AbilityComp->GetBoundQueueV2ForTest();
+
+			FGMASBoundQueueV2ApplyEffectOperation ApplyOp;
+			ApplyOp.EffectClass = UGMCAbilityEffect::StaticClass();
+			ApplyOp.OperationID = 11;
+			FGMASBoundQueueV2AbilityActivationOperation ActivationOp;
+			ActivationOp.OperationID = 12;
+
+			FGMASBugFixLogCapture Capture(TEXT("is not allowed by server as client input"));
+			TestFalse("positive-id effect echo is not client input",
+				Q.IsValidLiveClientOperation(FInstancedStruct::Make<FGMASBoundQueueV2ApplyEffectOperation>(ApplyOp)));
+			TestFalse("positive-id activation echo is not client input",
+				Q.IsValidLiveClientOperation(FInstancedStruct::Make<FGMASBoundQueueV2AbilityActivationOperation>(ActivationOp)));
+			TestFalse("empty slot is not client input",
+				Q.IsValidLiveClientOperation(FInstancedStruct::Make<FGMASBoundQueueV2OperationBaseData>()));
+			TestEqual("no rejection logged", Capture.Hits, 0);
+		});
+
+		It("live-slot check still validates and rejects client-made (negative) ids", [this]()
+		{
+			AddExpectedErrorPlain(TEXT("is not allowed by server as client input"), EAutomationExpectedErrorFlags::Contains, 1);
+			FGMASBoundQueueV2& Q = AbilityComp->GetBoundQueueV2ForTest();
+
+			FGMASBoundQueueV2AbilityActivationOperation ActivationOp;
+			ActivationOp.OperationID = -3;
+			TestTrue("negative-id activation is client input",
+				Q.IsValidLiveClientOperation(FInstancedStruct::Make<FGMASBoundQueueV2AbilityActivationOperation>(ActivationOp)));
+
+			FGMASBoundQueueV2ApplyEffectOperation ApplyOp;
+			ApplyOp.EffectClass = UGMCAbilityEffect::StaticClass();
+			ApplyOp.OperationID = -4;
+			TestFalse("negative-id server-only type is rejected",
+				Q.IsValidLiveClientOperation(FInstancedStruct::Make<FGMASBoundQueueV2ApplyEffectOperation>(ApplyOp)));
 		});
 	});
 

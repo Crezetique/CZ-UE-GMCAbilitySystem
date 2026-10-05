@@ -305,10 +305,12 @@ void UGMC_AbilitySystemComponent::GenAncillaryTick(float DeltaTime, bool bIsComb
 		//   so the call was a no-op there.
 		// - Listen server local pawn: empty queue → was setting OperationData to
 		//   empty base, destroying the deferred ability payload (the bug).
-		// - Server-side ClientQueuedOperations cannot be populated (all 4 callers
-		//   gated by !HasAuthority(), and RPCOnServerOperationAdded is Client-RPC).
-		//   CheckValidState (GMASBoundQueueV2.cpp) already logs an
-		//   Error if it ever happens -- the drain was idempotent defensive code.
+		// - Server-side ClientQueuedOperations is populated only for a locally controlled
+		//   server pawn (listen host, AI): RPCOnServerOperationAdded is a Client RPC that runs
+		//   on the server itself when the pawn has no remote owner. That pawn's own
+		//   PreLocalMoveExecution drains it, and a forced op removes its id, so a second drain
+		//   here is not needed. CheckValidState (GMASBoundQueueV2.cpp) logs an Error when a pawn
+		//   that never drains the queue holds entries.
 		//
 		// Route by who FILLS the live slot, because that decides whether the payload is
 		// client-supplied. On a remotely controlled pawn SV_ApplyValidatedState copied the client
@@ -326,12 +328,12 @@ void UGMC_AbilitySystemComponent::GenAncillaryTick(float DeltaTime, bool bIsComb
 		//
 		// An empty slot and a client-direction batch wrapper both carry OperationID 0, so both are
 		// skipped quietly: the batch is server-direction only, and its ack reaches us through the
-		// OutputState path above.
+		// OutputState path above. A server-made id (positive) is the owner's echo of a server
+		// operation's payload; the owner acknowledged it in the OutputState, which the path above
+		// already handled, so it is skipped quietly too.
 		if (GMCMovementComponent->IsPlayerControlledPawn() && !GMCMovementComponent->IsLocallyControlledServerPawn())
 		{
-			const FGMASBoundQueueV2OperationBaseData* LiveOperation = BoundQueueV2.OperationData.GetPtr<FGMASBoundQueueV2OperationBaseData>();
-			if (LiveOperation && LiveOperation->OperationID != 0
-				&& BoundQueueV2.IsValidClientOperation(BoundQueueV2.OperationData))
+			if (BoundQueueV2.IsValidLiveClientOperation(BoundQueueV2.OperationData))
 			{
 				ProcessOperation(BoundQueueV2.OperationData, false);
 			}
@@ -4654,9 +4656,12 @@ void UGMC_AbilitySystemComponent::EnqueueServerOperation(const int OperationID)
 	// movement tick -- decrements (0 - DeltaTime <= 0) and force-applies via
 	// OnServerOperationForced -> ProcessOperation(bForce=true). That is the exact
 	// proven-correct path the grace timeout always used, now ~1 frame instead of the full grace.
-	// QueueServerOperation also fires the Client RPC, which is a harmless no-op for a
-	// pawn with no owning connection. ProcessOperation drains the cached payload and
-	// the grace tick removes the grace-map entry, so the op applies exactly once.
+	// QueueServerOperation also fires the Client RPC. With no owning connection it runs on
+	// the server itself and adds the id to ClientQueuedOperations, so a locally controlled
+	// pawn's next PreLocalMoveExecution can land it in its prediction tick instead. Whichever
+	// path runs first applies the op: the prediction tick drains the payload (the force then
+	// finds nothing), or the force applies it and removes the queued id. Either way the op
+	// applies exactly once.
 	BoundQueueV2.QueueServerOperation(OperationID, /*Timeout=*/0.f);
 }
 

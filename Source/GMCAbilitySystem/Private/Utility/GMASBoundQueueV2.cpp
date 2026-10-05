@@ -40,6 +40,19 @@ bool FGMASBoundQueueV2::IsValidClientOperation(const FInstancedStruct& Data) con
 	return false;
 }
 
+bool FGMASBoundQueueV2::IsValidLiveClientOperation(const FInstancedStruct& Data) const
+{
+	// Only a client-made operation (negative id) is client input. Id 0 is an empty slot or a batch
+	// wrapper; a positive id is the owner's echo of a server operation, acknowledged through the
+	// output state.
+	const FGMASBoundQueueV2OperationBaseData* BaseData = Data.GetPtr<FGMASBoundQueueV2OperationBaseData>();
+	if (!BaseData || BaseData->OperationID >= 0)
+	{
+		return false;
+	}
+	return IsValidClientOperation(Data);
+}
+
 void FGMASBoundQueueV2::ClearStaleOperationData()
 {
 	const int MaximumFreshMoveIndex = GMCMoveCounter - GMCMovementComponent->MoveHistoryMaxSize;
@@ -173,8 +186,6 @@ void FGMASBoundQueueV2::GenPreLocalMoveExecution()
 
 void FGMASBoundQueueV2::GenAncillaryTick(const float DeltaTime)
 {
-	CheckValidState();
-
 	if (GMCMovementComponent->GetNetMode() >= NM_Client)
 	{
 		GMCMoveCounter++;
@@ -193,15 +204,25 @@ void FGMASBoundQueueV2::GenAncillaryTick(const float DeltaTime)
 				OnServerOperationForced.Broadcast(OperationPayloads[It.Key()]);
 				OperationPayloads.Remove(It.Key());
 			}
+			// A server-controlled pawn received its own copy through the loopback Client RPC; the forced
+			// apply spends it, so the next local move must not pop the id again.
+			ClientQueuedOperations.Remove(It.Key());
 			It.RemoveCurrent();
 		}
 	}
+
+	// After the forced drain, so an operation applied this tick is not reported as pending.
+	CheckValidState();
 }
 
 void FGMASBoundQueueV2::CacheOperationPayload(const int OperationID, const FInstancedStruct& Payload)
 {
 	OperationPayloads.Add(OperationID, Payload);
-	OperationDataCacheExpiration.Add({OperationID, GMCMoveCounter});
+	// Only a client advances GMCMoveCounter and prunes this list (GenAncillaryTick); elsewhere it would only grow.
+	if (GMCMovementComponent && GMCMovementComponent->GetNetMode() >= NM_Client)
+	{
+		OperationDataCacheExpiration.Add({OperationID, GMCMoveCounter});
+	}
 }
 
 void FGMASBoundQueueV2::QueueClientOperation(const int OperationID)
@@ -276,7 +297,9 @@ void FGMASBoundQueueV2::CheckValidState() const
 {
 	if (GMCMovementComponent->GetNetMode() < NM_Client)
 	{
-		if (ClientQueuedOperations.Num() > 0)
+		// A locally controlled server pawn (listen host, AI) fills this queue through its own loopback Client
+		// RPC and drains it on its next local move; only a pawn that never drains it is in a bad state.
+		if (ClientQueuedOperations.Num() > 0 && !GMCMovementComponent->IsLocallyControlledServerPawn())
 		{
 			if (!bReportedClientQueuedOnServer)
 			{
