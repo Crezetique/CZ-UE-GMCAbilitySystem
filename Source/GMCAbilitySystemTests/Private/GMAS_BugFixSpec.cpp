@@ -1281,6 +1281,7 @@ void FGMASBugFixSpec::Define()
 			AbilityComp->GetProcessedEffectIDsForTest().Add(Applied2->EffectData.EffectID, EGMCEffectAnswerState::Pending);
 			AbilityComp->BoundActiveEffectIDs_Remove(Applied2->EffectData.EffectID);
 			AbilityComp->SetActionTimerForTest(5.0);
+			AbilityComp->AdvanceConfirmClockForTest(5.0);   // the confirmation timeout runs on the confirm clock
 
 			// Force the replay gate active. Both the polling and the reap branch should skip.
 			AbilityComp->bForceReplayingForTest = true;
@@ -1355,6 +1356,7 @@ void FGMASBugFixSpec::Define()
 			// arrival of the verdict. The clock goes past the confirmation timeout (apply at 1.0 +
 			// 0.5 s) but short of A's deferred end at 2.0 so the reap fires while A is still due.
 			AbilityComp->BoundActiveEffectIDs_Remove(AppliedB->EffectData.EffectID);
+			AbilityComp->AdvanceConfirmClockForTest(0.75);   // confirm clock past apply + 0.5 s, while ActionTimer stays short of A's end
 			AbilityComp->SetActionTimerForTest(1.75);
 			AbilityComp->TickActiveEffects(0.f);
 
@@ -1714,6 +1716,7 @@ void FGMASBugFixSpec::Define()
 			// is 0.5 (project settings); effect's
 			// ClientEffectApplicationTime was set to 1.0 in InitializeEffect.
 			AbilityComp->SetActionTimerForTest(5.0);
+			AbilityComp->AdvanceConfirmClockForTest(5.0);   // the confirmation timeout runs on the confirm clock
 			RunPollingOnce();
 			AbilityComp->TickActiveEffects(0.f);
 
@@ -1809,6 +1812,7 @@ void FGMASBugFixSpec::Define()
 
 			// Polling promotes IdOK; advance past timeout to reap IdDrop.
 			AbilityComp->SetActionTimerForTest(5.0);
+			AbilityComp->AdvanceConfirmClockForTest(5.0);   // the confirmation timeout runs on the confirm clock
 			RunPollingOnce();
 			AbilityComp->TickActiveEffects(0.f);
 
@@ -2506,6 +2510,60 @@ void FGMASBugFixSpec::Define()
 			TestFalse("oldest entry evicted", Q.WasOperationRecentlyProcessed(7));
 			TestTrue ("newest entry retained",
 				Q.WasOperationRecentlyProcessed(1000 + FGMASBoundQueueV2::MaxRecentlyProcessedOperations + 49));
+		});
+	});
+
+	Describe("Live-slot operation ownership", [this]()
+	{
+		It("treats only negative ids as client-made", [this]()
+		{
+			TestTrue ("client id -3 is client-made", FGMASBoundQueueV2::IsClientMadeOperationID(-3));
+			TestFalse("0 (empty slot / batch wrapper) is skipped", FGMASBoundQueueV2::IsClientMadeOperationID(0));
+			TestFalse("server id 7 is skipped", FGMASBoundQueueV2::IsClientMadeOperationID(7));
+		});
+	});
+
+	// A server-authored SetActorLocation operation marks the teleport so simulated proxies snap
+	// (bJustTeleported is bound to the output state). Inside a move the flag is set for that
+	// move; outside one it is carried into the next live GenPredictionTick; the move after clears it.
+	Describe("SetActorLocation operation teleport mark", [this]()
+	{
+		// Outside a move the dispatch only applies a forced operation (the grace expiry of a pawn without a client).
+		auto ApplyTeleportOp = [this](bool bFromMovementTick)
+		{
+			FGMASBoundQueueV2SetActorLocationOperation Op;
+			Op.Location = FVector(500.0, 0.0, 0.0);
+			const int OpID = AbilityComp->GetBoundQueueV2ForTest().MakeOperationData<FGMASBoundQueueV2SetActorLocationOperation>(Op);
+			FGMASBoundQueueV2OperationBaseData Wrapper;
+			Wrapper.OperationID = OpID;
+			const bool bApplied = AbilityComp->ProcessOperationForTest(FInstancedStruct::Make<FGMASBoundQueueV2OperationBaseData>(Wrapper), bFromMovementTick, !bFromMovementTick);
+			// MakeOperationData also fills the live slot; later moves would re-read it and re-apply the cached payload.
+			AbilityComp->GetBoundQueueV2ForTest().RemovePayloadByID(OpID);
+			AbilityComp->GetBoundQueueV2ForTest().OperationData = FInstancedStruct::Make<FGMASBoundQueueV2OperationBaseData>(FGMASBoundQueueV2OperationBaseData());
+			return bApplied;
+		};
+
+		It("sets the flag for the current move when applied inside a move", [this, ApplyTeleportOp]()
+		{
+			AbilityComp->GenPredictionTick(0.f);
+			TestFalse("flag clear at the start of the move", AbilityComp->bJustTeleported);
+			TestTrue("op applied", ApplyTeleportOp(true));
+			TestTrue("flag set for this move's output", AbilityComp->bJustTeleported);
+			TestFalse("nothing pending: the next move is not marked twice", AbilityComp->GetTeleportPendingForMoveForTest());
+			AbilityComp->GenPredictionTick(0.f);
+			TestFalse("flag cleared on the move after", AbilityComp->bJustTeleported);
+		});
+
+		It("carries an op applied outside a move into the next GenPredictionTick", [this, ApplyTeleportOp]()
+		{
+			AbilityComp->GenPredictionTick(0.f);
+			TestTrue("op applied outside a move", ApplyTeleportOp(false));
+			TestTrue("pending until the next move", AbilityComp->GetTeleportPendingForMoveForTest());
+			AbilityComp->GenPredictionTick(0.f);
+			TestTrue("the next move carries the flag", AbilityComp->bJustTeleported);
+			TestFalse("pending consumed", AbilityComp->GetTeleportPendingForMoveForTest());
+			AbilityComp->GenPredictionTick(0.f);
+			TestFalse("flag cleared on the move after", AbilityComp->bJustTeleported);
 		});
 	});
 }

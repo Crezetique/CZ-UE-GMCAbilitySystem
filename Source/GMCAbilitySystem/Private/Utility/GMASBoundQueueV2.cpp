@@ -46,7 +46,7 @@ bool FGMASBoundQueueV2::IsValidLiveClientOperation(const FInstancedStruct& Data)
 	// wrapper; a positive id is the owner's echo of a server operation, acknowledged through the
 	// output state.
 	const FGMASBoundQueueV2OperationBaseData* BaseData = Data.GetPtr<FGMASBoundQueueV2OperationBaseData>();
-	if (!BaseData || BaseData->OperationID >= 0)
+	if (!BaseData || IsClientMadeOperationID(BaseData->OperationID) == false)
 	{
 		return false;
 	}
