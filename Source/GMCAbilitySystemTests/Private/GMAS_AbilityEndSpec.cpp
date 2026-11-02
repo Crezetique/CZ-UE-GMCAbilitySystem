@@ -571,7 +571,9 @@ void FGMASAbilityEndSpec::Define()
 		// Networked, a Ticking removal is deferred by the grace (both sides end it at the same
 		// ActionTimer), so the removed cost is still registered and live when the first instance ends
 		// inside the window. The forgotten declaration must not end anything at that end, and the
-		// deferred end must still land after the grace. Positive clock: EndAtActionTimer < 0 means unarmed.
+		// deferred end must still land after the grace. A removal made between moves arms on the next
+		// local move, and the effect ends on the first move strictly after the armed time.
+		// Positive clock: EndAtActionTimer < 0 means unarmed.
 		It("networked: RemoveAbilityCost inside the grace window leaves the sibling's cost live and the removed cost ends after the grace", [this]()
 		{
 			AbilityComp->bForceNetworkedForTest = true;
@@ -596,16 +598,19 @@ void FGMASAbilityEndSpec::Define()
 
 			First->RemoveAbilityCost();
 			TestFalse("removed cost deferred, not ended", RemovedCost->bCompleted);
-			TestEqual("removed cost armed at 1.5", RemovedCost->EndAtActionTimer, 1.5);
+			TestEqual("removed cost waits for the next move to arm", RemovedCost->PendingEndGrace, 0.5);
 
 			AbilityComp->SetActionTimerForTest(1.25); AbilityComp->TickActiveEffects(0.25f);
+			TestEqual("removed cost armed at 1.75 by the next move", RemovedCost->EndAtActionTimer, 1.75);
 			First->CancelAbility();
 			TestEqual("first Ended", First->AbilityState, EAbilityState::Ended);
 			TestFalse("sibling's cost live after the first end", SiblingCost->bCompleted);
 			TestEqual("sibling's cost not armed", SiblingCost->EndAtActionTimer, -1.0);
 			TestFalse("removed cost still inside its grace", RemovedCost->bCompleted);
 
-			AbilityComp->SetActionTimerForTest(1.5); AbilityComp->TickActiveEffects(0.25f);
+			AbilityComp->SetActionTimerForTest(1.75); AbilityComp->TickActiveEffects(0.5f);
+			TestFalse("removed cost still alive at its armed time", RemovedCost->bCompleted);
+			AbilityComp->SetActionTimerForTest(2.0); AbilityComp->TickActiveEffects(0.25f);
 			TestTrue("removed cost ended after the grace", RemovedCost->bCompleted);
 			TestFalse("sibling's cost still live", SiblingCost->bCompleted);
 		});
